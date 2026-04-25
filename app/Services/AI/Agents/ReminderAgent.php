@@ -6,6 +6,7 @@ use App\Models\ChecklistItem;
 use App\Models\Day;
 use App\Models\Room;
 use App\Models\User;
+use App\Services\AI\ExecutionContext;
 
 class ReminderAgent
 {
@@ -20,17 +21,19 @@ class ReminderAgent
 
     public function handle(array $action): array
     {
-        return match ($action['intent'] ?? '') {
-            'create_reminder' => $this->createReminder($action['data'] ?? []),
-            default           => ['success' => false, 'error' => 'Intent inconnue : ' . ($action['intent'] ?? 'null')],
-        };
+        return $this->createReminder($action['data'] ?? [], null);
+    }
+
+    public function handleWithContext(array $action, ExecutionContext $context): array
+    {
+        return $this->createReminder($action['data'] ?? [], $context);
     }
 
     // ─────────────────────────────────────────────
     // Reminders without a patient are stored on a global day-level "reminder room"
     // Reminders with a patient are stored as checklist items on that patient
     // ─────────────────────────────────────────────
-    private function createReminder(array $data): array
+    private function createReminder(array $data, ?ExecutionContext $context): array
     {
         $title       = $data['title']        ?? null;
         $remindAt    = $data['remind_at']    ?? $data['time'] ?? null;
@@ -43,7 +46,8 @@ class ReminderAgent
 
         // If a patient is mentioned, attach reminder to their checklist
         if ($patientName) {
-            $patient = $this->patientAgent->resolvePatient($patientName, $roomNumber);
+            $patient = $context?->getPatient($patientName)
+                ?? $this->patientAgent->resolvePatient($patientName, $roomNumber);
 
             if ($patient) {
                 $item = ChecklistItem::create([

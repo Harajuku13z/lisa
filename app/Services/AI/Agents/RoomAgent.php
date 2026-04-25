@@ -5,6 +5,7 @@ namespace App\Services\AI\Agents;
 use App\Models\Day;
 use App\Models\Room;
 use App\Models\User;
+use App\Services\AI\ExecutionContext;
 use Illuminate\Support\Facades\Log;
 
 class RoomAgent
@@ -16,15 +17,25 @@ class RoomAgent
 
     public function handle(array $action): array
     {
+        return $this->dispatch($action, null);
+    }
+
+    public function handleWithContext(array $action, ExecutionContext $context): array
+    {
+        return $this->dispatch($action, $context);
+    }
+
+    private function dispatch(array $action, ?ExecutionContext $context): array
+    {
         return match ($action['intent'] ?? '') {
-            'create_room' => $this->createRoom($action['data'] ?? []),
-            'find_room'   => $this->findRoom($action['data'] ?? []),
+            'create_room' => $this->createRoom($action['data'] ?? [], $context),
+            'find_room'   => $this->findRoom($action['data'] ?? [], $context),
             default       => ['success' => false, 'error' => 'Intent inconnue : ' . ($action['intent'] ?? 'null')],
         };
     }
 
     // ─────────────────────────────────────────────
-    private function createRoom(array $data): array
+    private function createRoom(array $data, ?ExecutionContext $context = null): array
     {
         $roomNumber = $data['room_number'] ?? null;
 
@@ -44,6 +55,7 @@ class RoomAgent
             ->first();
 
         if ($existing) {
+            $context?->rememberRoom($existing);
             return [
                 'success' => true,
                 'room'    => $existing,
@@ -56,6 +68,8 @@ class RoomAgent
             'number' => (string) $roomNumber,
         ]);
 
+        $context?->rememberRoom($room);
+
         return [
             'success' => true,
             'room'    => $room,
@@ -64,7 +78,7 @@ class RoomAgent
     }
 
     // ─────────────────────────────────────────────
-    private function findRoom(array $data): array
+    private function findRoom(array $data, ?ExecutionContext $context = null): array
     {
         $roomNumber = $data['room_number'] ?? null;
 
@@ -88,6 +102,7 @@ class RoomAgent
             return ['success' => false, 'error' => "Chambre {$roomNumber} introuvable"];
         }
 
+        $context?->rememberRoom($room);
         return ['success' => true, 'room' => $room];
     }
 

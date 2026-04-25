@@ -4,6 +4,7 @@ namespace App\Services\AI\Agents;
 
 use App\Models\ChecklistItem;
 use App\Models\User;
+use App\Services\AI\ExecutionContext;
 
 class AppointmentAgent
 {
@@ -18,16 +19,18 @@ class AppointmentAgent
 
     public function handle(array $action): array
     {
-        return match ($action['intent'] ?? '') {
-            'create_appointment' => $this->createAppointment($action['data'] ?? []),
-            default              => ['success' => false, 'error' => 'Intent inconnue : ' . ($action['intent'] ?? 'null')],
-        };
+        return $this->createAppointment($action['data'] ?? [], null);
+    }
+
+    public function handleWithContext(array $action, ExecutionContext $context): array
+    {
+        return $this->createAppointment($action['data'] ?? [], $context);
     }
 
     // ─────────────────────────────────────────────
     // Appointments are stored as checklist items with a due_label (time)
     // ─────────────────────────────────────────────
-    private function createAppointment(array $data): array
+    private function createAppointment(array $data, ?ExecutionContext $context): array
     {
         $patientName = $data['patient_name'] ?? null;
         $roomNumber  = $data['room_number']  ?? null;
@@ -38,7 +41,8 @@ class AppointmentAgent
             return ['success' => false, 'error' => 'Titre du rendez-vous manquant'];
         }
 
-        $patient = $this->patientAgent->resolvePatient($patientName, $roomNumber);
+        $patient = $context?->getPatient($patientName)
+            ?? $this->patientAgent->resolvePatient($patientName, $roomNumber);
 
         if (!$patient) {
             return ['success' => false, 'error' => "Patient introuvable pour le rendez-vous : {$title}"];

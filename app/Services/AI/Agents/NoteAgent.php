@@ -4,6 +4,7 @@ namespace App\Services\AI\Agents;
 
 use App\Models\User;
 use App\Models\VoiceNote;
+use App\Services\AI\ExecutionContext;
 
 class NoteAgent
 {
@@ -18,14 +19,16 @@ class NoteAgent
 
     public function handle(array $action): array
     {
-        return match ($action['intent'] ?? '') {
-            'create_note' => $this->createNote($action['data'] ?? []),
-            default       => ['success' => false, 'error' => 'Intent inconnue : ' . ($action['intent'] ?? 'null')],
-        };
+        return $this->createNote($action['data'] ?? [], null);
+    }
+
+    public function handleWithContext(array $action, ExecutionContext $context): array
+    {
+        return $this->createNote($action['data'] ?? [], $context);
     }
 
     // ─────────────────────────────────────────────
-    private function createNote(array $data): array
+    private function createNote(array $data, ?ExecutionContext $context): array
     {
         $content     = $data['content'] ?? $data['note'] ?? $data['text'] ?? null;
         $patientName = $data['patient_name'] ?? null;
@@ -38,7 +41,8 @@ class NoteAgent
         $patientId = null;
 
         if ($patientName) {
-            $patient   = $this->patientAgent->resolvePatient($patientName, $roomNumber);
+            $patient   = $context?->getPatient($patientName)
+                ?? $this->patientAgent->resolvePatient($patientName, $roomNumber);
             $patientId = $patient?->id;
         }
 

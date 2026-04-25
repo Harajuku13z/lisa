@@ -6,6 +6,7 @@ use App\Models\Day;
 use App\Models\Patient;
 use App\Models\Room;
 use App\Models\User;
+use App\Services\AI\ExecutionContext;
 
 class PatientAgent
 {
@@ -16,15 +17,25 @@ class PatientAgent
 
     public function handle(array $action): array
     {
+        return $this->dispatch($action, null);
+    }
+
+    public function handleWithContext(array $action, ExecutionContext $context): array
+    {
+        return $this->dispatch($action, $context);
+    }
+
+    private function dispatch(array $action, ?ExecutionContext $context): array
+    {
         return match ($action['intent'] ?? '') {
-            'create_patient' => $this->createPatient($action['data'] ?? []),
-            'find_patient'   => $this->findPatient($action['data'] ?? []),
+            'create_patient' => $this->createPatient($action['data'] ?? [], $context),
+            'find_patient'   => $this->findPatient($action['data'] ?? [], $context),
             default          => ['success' => false, 'error' => 'Intent inconnue : ' . ($action['intent'] ?? 'null')],
         };
     }
 
     // ─────────────────────────────────────────────
-    private function createPatient(array $data): array
+    private function createPatient(array $data, ?ExecutionContext $context): array
     {
         $patientName = $data['patient_name'] ?? null;
         $roomNumber  = $data['room_number']  ?? null;
@@ -33,30 +44,33 @@ class PatientAgent
             return ['success' => false, 'error' => 'Nom du patient manquant'];
         }
 
-        $room = $this->resolveRoom($roomNumber);
+        // 1. Try to find the room — first in context, then DB, then auto-create
+        $room = $context?->getRoom($roomNumber) ?? $this->resolveRoom($roomNumber);
 
-        if (!$room) {
-            // Auto-create room if number was given
-            if ($roomNumber) {
-                $roomAgent = new RoomAgent($this->user, $this->date);
-                $result    = $roomAgent->handle(['intent' => 'create_room', 'data' => ['room_number' => $roomNumber]]);
-                $room      = $result['room'] ?? null;
-            }
-
-            if (!$room) {
-                return ['success' => false, 'error' => 'Chambre introuvable et aucun numéro fourni'];
-            }
+        if (!$room && $roomNumber) {
+            $roomAgent = new RoomAgent($this->user, $this->date);
+            $result    = method_exists($roomAgent, 'handleWithContext') && $context
+                ? $roomAgent->handleWithContext(['intent' => 'create_room', 'data' => ['room_number' => $roomNumber]], $context)
+                : $roomAgent->handle(['intent' => 'create_room', 'data' => ['room_number' => $roomNumber]]);
+            $room = $result['room'] ?? null;
         }
 
-        // Avoid duplicate patient in same room
+        if (!$room) {
+            return ['success' => false, 'error' => 'Chambre introuvable et aucun numéro fourni'];
+        }
+
+        // 2. Avoid duplicate patient in same room
         $existing = Patient::where('room_id', $room->id)
             ->whereRaw('LOWER(name) = ?', [mb_strtolower($patientName)])
             ->first();
 
         if ($existing) {
+            $context?->rememberPatient($existing);
+            $context?->rememberRoom($room);
             return [
                 'success' => true,
                 'patient' => $existing,
+                'room'    => $room,
                 'message' => "{$patientName} existe déjà dans la chambre {$room->number}",
             ];
         }
@@ -71,6 +85,9 @@ class PatientAgent
             'diagnosis' => $data['diagnosis'] ?? null,
         ]);
 
+        $context?->rememberPatient($patient);
+        $context?->rememberRoom($room);
+
         return [
             'success' => true,
             'patient' => $patient,
@@ -80,13 +97,16 @@ class PatientAgent
     }
 
     // ─────────────────────────────────────────────
-    private function findPatient(array $data): array
+    private function findPatient(array $data, ?ExecutionContext $context): array
     {
-        $patient = $this->resolvePatient($data['patient_name'] ?? null, $data['room_number'] ?? null);
+        $patient = $context?->getPatient($data['patient_name'] ?? null)
+            ?? $this->resolvePatient($data['patient_name'] ?? null, $data['room_number'] ?? null);
 
         if (!$patient) {
             return ['success' => false, 'error' => 'Patient introuvable'];
         }
+
+        $context?->rememberPatient($patient);
 
         return ['success' => true, 'patient' => $patient];
     }
@@ -98,12 +118,16 @@ class PatientAgent
     {
         if (!$name) return null;
 
+        // NOTE: relation `room` was renamed to `assignedRoom` because the
+        // legacy `room` column on the patients table shadowed it.
         $query = Patient::query()
-            ->whereHas('room.day', fn ($q) => $q->where('user_id', $this->user->id)->where('date', $this->date))
+            ->whereHas('assignedRoom.day', fn ($q) => $q
+                ->where('user_id', $this->user->id)
+                ->where('date', $this->date))
             ->whereRaw('LOWER(name) LIKE ?', ['%' . mb_strtolower($name) . '%']);
 
         if ($roomNumber) {
-            $query->whereHas('room', fn ($q) => $q->where('number', (string) $roomNumber));
+            $query->whereHas('assignedRoom', fn ($q) => $q->where('number', (string) $roomNumber));
         }
 
         return $query->first();

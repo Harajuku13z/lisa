@@ -4,6 +4,7 @@ namespace App\Services\AI\Agents;
 
 use App\Models\User;
 use App\Models\VitalSign;
+use App\Services\AI\ExecutionContext;
 
 class VitalSignsAgent
 {
@@ -29,18 +30,20 @@ class VitalSignsAgent
 
     public function handle(array $action): array
     {
-        return match ($action['intent'] ?? '') {
-            'add_vital_sign' => $this->addVitalSign($action['data'] ?? []),
-            default          => ['success' => false, 'error' => 'Intent inconnue : ' . ($action['intent'] ?? 'null')],
-        };
+        return $this->addVitalSign($action['data'] ?? [], null);
+    }
+
+    public function handleWithContext(array $action, ExecutionContext $context): array
+    {
+        return $this->addVitalSign($action['data'] ?? [], $context);
     }
 
     // ─────────────────────────────────────────────
-    private function addVitalSign(array $data): array
+    private function addVitalSign(array $data, ?ExecutionContext $context): array
     {
         $patientName = $data['patient_name'] ?? null;
         $roomNumber  = $data['room_number']  ?? null;
-        $type        = $data['type']         ?? null;
+        $type        = $data['type']         ?? $data['vital_type'] ?? null;
         $value       = $data['value']        ?? null;
 
         if (!$type || $value === null || $value === '') {
@@ -51,7 +54,8 @@ class VitalSignsAgent
             return ['success' => false, 'error' => "Type de constante inconnu : {$type}"];
         }
 
-        $patient = $this->patientAgent->resolvePatient($patientName, $roomNumber);
+        $patient = $context?->getPatient($patientName)
+            ?? $this->patientAgent->resolvePatient($patientName, $roomNumber);
 
         if (!$patient) {
             return ['success' => false, 'error' => "Patient introuvable pour la constante {$type}"];

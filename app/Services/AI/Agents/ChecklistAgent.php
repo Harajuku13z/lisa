@@ -4,6 +4,7 @@ namespace App\Services\AI\Agents;
 
 use App\Models\ChecklistItem;
 use App\Models\User;
+use App\Services\AI\ExecutionContext;
 
 class ChecklistAgent
 {
@@ -18,25 +19,36 @@ class ChecklistAgent
 
     public function handle(array $action): array
     {
+        return $this->dispatch($action, null);
+    }
+
+    public function handleWithContext(array $action, ExecutionContext $context): array
+    {
+        return $this->dispatch($action, $context);
+    }
+
+    private function dispatch(array $action, ?ExecutionContext $context): array
+    {
         return match ($action['intent'] ?? '') {
-            'create_checklist_item' => $this->createItem($action['data'] ?? []),
-            'toggle_checklist_item' => $this->toggleItem($action['data'] ?? []),
+            'create_checklist_item' => $this->createItem($action['data'] ?? [], $context),
+            'toggle_checklist_item' => $this->toggleItem($action['data'] ?? [], $context),
             default                 => ['success' => false, 'error' => 'Intent inconnue : ' . ($action['intent'] ?? 'null')],
         };
     }
 
     // ─────────────────────────────────────────────
-    private function createItem(array $data): array
+    private function createItem(array $data, ?ExecutionContext $context): array
     {
         $patientName = $data['patient_name'] ?? null;
         $roomNumber  = $data['room_number']  ?? null;
-        $task        = $data['task']         ?? null;
+        $task        = $data['task']         ?? $data['title'] ?? null;
 
         if (!$task) {
             return ['success' => false, 'error' => 'Tâche manquante'];
         }
 
-        $patient = $this->patientAgent->resolvePatient($patientName, $roomNumber);
+        $patient = $context?->getPatient($patientName)
+            ?? $this->patientAgent->resolvePatient($patientName, $roomNumber);
 
         if (!$patient) {
             return ['success' => false, 'error' => "Patient introuvable pour la tâche : {$task}"];
@@ -62,17 +74,18 @@ class ChecklistAgent
     }
 
     // ─────────────────────────────────────────────
-    private function toggleItem(array $data): array
+    private function toggleItem(array $data, ?ExecutionContext $context): array
     {
         $patientName = $data['patient_name'] ?? null;
         $roomNumber  = $data['room_number']  ?? null;
-        $task        = $data['task']         ?? null;
+        $task        = $data['task']         ?? $data['title'] ?? null;
 
         if (!$task) {
             return ['success' => false, 'error' => 'Tâche à cocher manquante'];
         }
 
-        $patient = $this->patientAgent->resolvePatient($patientName, $roomNumber);
+        $patient = $context?->getPatient($patientName)
+            ?? $this->patientAgent->resolvePatient($patientName, $roomNumber);
         if (!$patient) {
             return ['success' => false, 'error' => 'Patient introuvable'];
         }
