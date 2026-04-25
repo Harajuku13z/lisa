@@ -12,7 +12,7 @@ class DayController extends Controller {
             ->orderByDesc('date')
             ->get()
             ->map(fn($d) => [
-                'date'          => $d->date,
+                'date'          => is_object($d->date) ? $d->date->format('Y-m-d') : substr((string) $d->date, 0, 10),
                 'room_count'    => $d->rooms_count,
                 'patient_count' => $d->patient_count,
             ]);
