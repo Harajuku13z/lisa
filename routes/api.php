@@ -2,6 +2,7 @@
 use App\Http\Controllers\API\AuthController;
 use App\Http\Controllers\API\ChecklistController;
 use App\Http\Controllers\API\DayController;
+use App\Http\Controllers\API\LisaAIController;
 use App\Http\Controllers\API\PatientController;
 use App\Http\Controllers\API\PatientNoteController;
 use App\Http\Controllers\API\RoomController;
@@ -44,6 +45,9 @@ Route::middleware('auth:sanctum')->group(function () {
     // Voice notes
     Route::post('/voice-notes', [VoiceNoteController::class, 'store']);
     Route::post('/voice-notes/structure', [VoiceNoteController::class, 'structure']);
+
+    // Lisa multi-agent AI orchestrator
+    Route::post('/lisa/message', [LisaAIController::class, 'message']);
 
     // Checklist
     Route::get('/patients/{patient}/checklist', [ChecklistController::class, 'index']);
