@@ -25,6 +25,12 @@ class ExecutionContext
     /** @var array<string, Patient> keyed by lowercase patient name */
     public array $patientMap = [];
 
+    /** Most recently remembered room/patient — used as fallback when an
+     *  agent action omits the room_number / patient_name (typical when
+     *  the AI just created the entity earlier in the same plan). */
+    public ?Room    $lastRoom    = null;
+    public ?Patient $lastPatient = null;
+
     /** @var array<int, array> human-readable per-action results */
     public array $results = [];
 
@@ -41,22 +47,40 @@ class ExecutionContext
     public function rememberRoom(Room $room): void
     {
         $this->roomMap[$this->normalizeRoomKey($room->number)] = $room;
+        $this->lastRoom = $room;
     }
 
     public function rememberPatient(Patient $patient): void
     {
         $this->patientMap[$this->normalizePatientKey($patient->name)] = $patient;
+        $this->lastPatient = $patient;
     }
 
+    /**
+     * Resolve a room from context. When $number is null/empty we return
+     * the most recently remembered room (typically the one the previous
+     * agent in the same plan just created).
+     */
     public function getRoom(?string $number): ?Room
     {
-        if ($number === null || $number === '') return null;
-        return $this->roomMap[$this->normalizeRoomKey($number)] ?? null;
+        if ($number === null || $number === '') {
+            return $this->lastRoom;
+        }
+        return $this->roomMap[$this->normalizeRoomKey($number)]
+            ?? $this->lastRoom; // fallback when AI used a slightly different number format
     }
 
+    /**
+     * Resolve a patient from context. When $name is null/empty we return
+     * the most recently remembered patient (so chained actions like
+     * "create patient + add vital" work even if the AI omitted the name
+     * on the second action).
+     */
     public function getPatient(?string $name): ?Patient
     {
-        if ($name === null || $name === '') return null;
+        if ($name === null || $name === '') {
+            return $this->lastPatient;
+        }
         $key = $this->normalizePatientKey($name);
         if (isset($this->patientMap[$key])) {
             return $this->patientMap[$key];
@@ -67,7 +91,7 @@ class ExecutionContext
                 return $patient;
             }
         }
-        return null;
+        return $this->lastPatient;
     }
 
     public function addError(string $message): void
