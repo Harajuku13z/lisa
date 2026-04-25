@@ -30,7 +30,11 @@ class VoiceNoteController extends Controller {
     }
 
     public function structure(Request $request) {
-        $data = $request->validate(['text' => 'required|string|max:5000']);
+        $data = $request->validate([
+            'raw_text' => 'required_without:text|string|max:5000',
+            'text'     => 'required_without:raw_text|string|max:5000',
+        ]);
+        $inputText = $data['raw_text'] ?? $data['text'];
 
         $prompt = <<<PROMPT
 Tu es une assistante pour infirmières. Analyse ce texte dicté et extrais les informations suivantes.
@@ -42,7 +46,7 @@ Retourne UNIQUEMENT un JSON valide avec cette structure :
       "patients": [
         {
           "name": "Mme Dupont",
-          "actions": ["pansement fait", "constantes relevées"]
+          "actions": ["température 38.5", "pansement fait", "rendez-vous médecin à 14h"]
         }
       ]
     }
@@ -53,12 +57,14 @@ Retourne UNIQUEMENT un JSON valide avec cette structure :
 Règles :
 - Ne jamais inventer d'informations non présentes dans le texte
 - Ne jamais faire de diagnostic médical
-- Si le nom du patient est absent, utiliser "Patient inconnu"
-- Si le numéro de chambre est absent, utiliser "0"
-- Conserver les actions exactement comme dictées
+- Si le nom du patient n'est PAS mentionné dans le texte, mettre "name": null (pas une chaîne vide, la valeur null)
+- Si le numéro de chambre n'est PAS mentionné, utiliser "0"
+- Mettre dans "actions" TOUT ce qui est dit sur le patient : constantes (température, tension, SpO2, pouls), observations cliniques, soins effectués, rendez-vous, médicaments, instructions
+- Conserver les actions exactement comme dictées, avec les valeurs chiffrées (ex: "température 38.5", "saturation 96", "tension 12/8")
 - raw_text doit contenir le texte original
+- Ne jamais utiliser "Patient inconnu" — préférer null si le nom est absent
 
-Texte à analyser : {$data['text']}
+Texte à analyser : {$inputText}
 PROMPT;
 
         try {
@@ -82,7 +88,7 @@ PROMPT;
                 return response()->json(['error' => 'Impossible de structurer le texte'], 422);
             }
 
-            $parsed['raw_text'] = $data['text'];
+            $parsed['raw_text'] = $inputText;
             return response()->json($parsed);
         } catch (\Exception $e) {
             Log::error('OpenAI error', ['error' => $e->getMessage()]);

@@ -14,6 +14,22 @@ class ChecklistController extends Controller {
         return response()->json($patient->checklistItems);
     }
 
+    public function store(Request $request, Patient $patient) {
+        $this->authorize($request, $patient);
+        $data = $request->validate([
+            'title'     => 'required|string|max:255',
+            'due_label' => 'nullable|string|max:20',
+            'priority'  => 'nullable|string|in:normal,important,urgent',
+        ]);
+        $item = $patient->checklistItems()->create([
+            'title'     => $data['title'],
+            'is_done'   => false,
+            'due_label' => $data['due_label'] ?? null,
+            'priority'  => $data['priority'] ?? 'normal',
+        ]);
+        return response()->json($item, 201);
+    }
+
     public function generate(Request $request, Patient $patient) {
         $this->authorize($request, $patient);
 

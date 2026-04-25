@@ -9,9 +9,9 @@ class VitalSignController extends Controller {
     public function store(Request $request, Patient $patient) {
         if ($patient->room->day->user_id !== $request->user()->id) abort(403);
         $data = $request->validate([
-            'temperature'       => 'nullable|numeric|min:30|max:45',
+            'temperature'       => 'nullable|numeric|min:0|max:50',
             'blood_pressure'    => 'nullable|string|max:20',
-            'heart_rate'        => 'nullable|integer|min:20|max:300',
+            'heart_rate'        => 'nullable|integer|min:0|max:300',
             'oxygen_saturation' => 'nullable|numeric|min:0|max:100',
             'notes'             => 'nullable|string',
         ]);

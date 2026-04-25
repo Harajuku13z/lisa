@@ -29,6 +29,12 @@ class PatientController extends Controller {
         return response()->json($patient->load('vitals', 'voiceNotes', 'checklistItems'));
     }
 
+    public function destroy(Request $request, Patient $patient) {
+        $this->authorizePatient($request, $patient);
+        $patient->delete();
+        return response()->json(['message' => 'Patient supprimé'], 200);
+    }
+
     private function authorizeRoom(Request $request, Room $room): void {
         if ($room->day->user_id !== $request->user()->id) abort(403);
     }
