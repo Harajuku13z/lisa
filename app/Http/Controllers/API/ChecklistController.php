@@ -80,15 +80,15 @@ PROMPT;
 
     public function update(Request $request, ChecklistItem $checklistItem) {
         $patient = $checklistItem->patient;
-        if (!$patient || !$patient->room || !$patient->room->day) abort(404);
-        if ($patient->room->day->user_id !== $request->user()->id) abort(403);
+        if (!$patient || !$patient->assignedRoom || !$patient->assignedRoom->day) abort(404);
+        if ($patient->assignedRoom->day->user_id !== $request->user()->id) abort(403);
         $data = $request->validate(['is_done' => 'required|boolean']);
         $checklistItem->update($data);
         return response()->json($checklistItem);
     }
 
     private function authorize(Request $request, Patient $patient): void {
-        if (!$patient->room || !$patient->room->day) abort(404);
-        if ($patient->room->day->user_id !== $request->user()->id) abort(403);
+        if (!$patient->assignedRoom || !$patient->assignedRoom->day) abort(404);
+        if ($patient->assignedRoom->day->user_id !== $request->user()->id) abort(403);
     }
 }

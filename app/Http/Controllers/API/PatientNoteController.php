@@ -11,8 +11,8 @@ class PatientNoteController extends Controller {
 
     public function process(Request $request, Patient $patient) {
         // Authorization
-        if (!$patient->room || !$patient->room->day) abort(404);
-        if ($patient->room->day->user_id !== $request->user()->id) abort(403);
+        if (!$patient->assignedRoom || !$patient->assignedRoom->day) abort(404);
+        if ($patient->assignedRoom->day->user_id !== $request->user()->id) abort(403);
 
         $data = $request->validate([
             'raw_text' => 'required|string|max:5000',

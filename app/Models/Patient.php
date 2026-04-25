@@ -7,7 +7,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class Patient extends Model {
     protected $fillable = ['room_id', 'name', 'full_name', 'initials', 'age', 'gender', 'diagnosis'];
 
-    public function room(): BelongsTo { return $this->belongsTo(Room::class); }
+    // Named 'assignedRoom' to avoid conflict with the legacy 'room' varchar column
+    public function assignedRoom(): BelongsTo { return $this->belongsTo(Room::class, 'room_id'); }
     public function vitals(): HasMany { return $this->hasMany(VitalSign::class)->latest(); }
     public function voiceNotes(): HasMany { return $this->hasMany(VoiceNote::class)->latest(); }
     public function checklistItems(): HasMany { return $this->hasMany(ChecklistItem::class); }
