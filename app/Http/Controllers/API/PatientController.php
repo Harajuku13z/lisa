@@ -53,6 +53,8 @@ class PatientController extends Controller {
     }
 
     private function authorizePatient(Request $request, Patient $patient): void {
+        // Patients with no room (orphaned) are not accessible
+        if (!$patient->room || !$patient->room->day) abort(404);
         if ($patient->room->day->user_id !== $request->user()->id) abort(403);
     }
 }

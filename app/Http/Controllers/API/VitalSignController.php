@@ -7,6 +7,7 @@ use Illuminate\Http\Request;
 
 class VitalSignController extends Controller {
     public function store(Request $request, Patient $patient) {
+        if (!$patient->room || !$patient->room->day) abort(404);
         if ($patient->room->day->user_id !== $request->user()->id) abort(403);
         $data = $request->validate([
             'temperature'       => 'nullable|numeric|min:0|max:50',
