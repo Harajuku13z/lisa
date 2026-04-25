@@ -20,8 +20,21 @@ class PatientController extends Controller {
             'gender'    => 'nullable|string|max:5',
             'diagnosis' => 'nullable|string',
         ]);
+
+        // Auto-generate initials and sync full_name for legacy DB compatibility
+        $data['full_name'] = $data['name'];
+        $data['initials']  = $this->makeInitials($data['name']);
+
         $patient = $room->patients()->create($data);
         return response()->json($patient->load('vitals', 'voiceNotes', 'checklistItems'), 201);
+    }
+
+    private function makeInitials(string $name): string {
+        $words = array_filter(explode(' ', mb_strtoupper(trim($name))));
+        if (count($words) >= 2) {
+            return mb_substr(array_shift($words), 0, 1) . mb_substr(array_shift($words), 0, 1);
+        }
+        return mb_substr($name, 0, 2, 'UTF-8');
     }
 
     public function show(Request $request, Patient $patient) {
