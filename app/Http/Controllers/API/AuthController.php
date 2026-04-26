@@ -2,6 +2,7 @@
 namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
+use App\Models\Colleague;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
@@ -38,6 +39,16 @@ class AuthController extends Controller {
             'password'          => Hash::make($data['password']),
             'email_verified_at' => now(),
         ]);
+
+        // Auto-link any pending colleague invitations addressed to this email,
+        // so existing nurses see this newcomer immediately as a linked colleague.
+        Colleague::whereRaw('LOWER(email) = ?', [strtolower($user->email)])
+            ->whereNull('colleague_user_id')
+            ->update([
+                'colleague_user_id' => $user->id,
+                'status'            => 'linked',
+                'linked_at'         => now(),
+            ]);
 
         $token = $user->createToken('lisa-mobile')->plainTextToken;
         return response()->json(['token' => $token, 'user' => $user], 201);

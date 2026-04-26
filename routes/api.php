@@ -1,12 +1,14 @@
 <?php
 use App\Http\Controllers\API\AuthController;
 use App\Http\Controllers\API\ChecklistController;
+use App\Http\Controllers\API\ColleagueController;
 use App\Http\Controllers\API\DayController;
 use App\Http\Controllers\API\LisaAIController;
 use App\Http\Controllers\API\PatientController;
 use App\Http\Controllers\API\PatientNoteController;
 use App\Http\Controllers\API\RoomController;
 use App\Http\Controllers\API\RoomVoiceController;
+use App\Http\Controllers\API\TransmissionController;
 use App\Http\Controllers\API\VitalSignController;
 use App\Http\Controllers\API\VoiceNoteController;
 use Illuminate\Support\Facades\Route;
@@ -54,4 +56,16 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/patients/{patient}/checklist', [ChecklistController::class, 'store']);
     Route::post('/patients/{patient}/generate-checklist', [ChecklistController::class, 'generate']);
     Route::put('/checklist/{checklistItem}', [ChecklistController::class, 'update']);
+
+    // Colleagues — add by email, list, remove
+    Route::get('/colleagues',          [ColleagueController::class, 'index']);
+    Route::post('/colleagues',         [ColleagueController::class, 'store']);
+    Route::delete('/colleagues/{id}',  [ColleagueController::class, 'destroy']);
+
+    // Transmissions — send a frozen day snapshot to email/colleague/self,
+    // list incoming, accept (merges into target_date) or decline.
+    Route::post('/transmissions',                  [TransmissionController::class, 'store']);
+    Route::get('/transmissions/incoming',          [TransmissionController::class, 'incoming']);
+    Route::post('/transmissions/{id}/accept',      [TransmissionController::class, 'accept']);
+    Route::post('/transmissions/{id}/decline',     [TransmissionController::class, 'decline']);
 });
