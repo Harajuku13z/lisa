@@ -38,6 +38,9 @@ return [
 
     'openai' => [
         'key'   => env('OPENAI_API_KEY'),
-        'model' => env('OPENAI_MODEL', 'gpt-4o-mini'),
+        // Default upgraded to `gpt-4o` (full model, not mini) so terse / mis-typed
+        // dictations like "Temperature 30" or "Il pèse 77 kilo" are reliably
+        // parsed into vital_signs operations. Override via OPENAI_MODEL env if needed.
+        'model' => env('OPENAI_MODEL', 'gpt-4o'),
     ],
 ];

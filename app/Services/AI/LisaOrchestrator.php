@@ -3,528 +3,529 @@
 namespace App\Services\AI;
 
 use App\Models\Patient;
+use App\Models\VoiceNote;
 use App\Models\Room;
 use App\Models\User;
-use App\Services\AI\Agents\AppointmentAgent;
-use App\Services\AI\Agents\ChecklistAgent;
-use App\Services\AI\Agents\NoteAgent;
-use App\Services\AI\Agents\PatientAgent;
-use App\Services\AI\Agents\ReminderAgent;
-use App\Services\AI\Agents\RoomAgent;
-use App\Services\AI\Agents\VitalSignsAgent;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class LisaOrchestrator
 {
-    private User   $user;
-    private string $date;
-    private array  $agents;
-
-    /**
-     * Strict execution order — actions later in the list depend on IDs
-     * created by earlier ones. Anything not listed runs after.
-     */
-    private const INTENT_ORDER = [
-        'create_room'           => 10,
-        'find_room'             => 15,
-        'create_patient'        => 20,
-        'find_patient'          => 25,
-        'link_patient_to_room'  => 30,
-        'add_vital_sign'        => 40,
-        'create_appointment'    => 50,
-        'create_checklist_item' => 60,
-        'toggle_checklist_item' => 65,
-        'create_reminder'       => 70,
-        'create_note'           => 80,
-    ];
-
-    /** Preloaded entities (set when called from PatientView/RoomView) */
     private ?Patient $preloadedPatient = null;
-    private ?Room    $preloadedRoom    = null;
+    private ?Room $preloadedRoom = null;
+    private IntentParser $intentParser;
+    private PlanValidator $planValidator;
+    private DependencyResolver $dependencyResolver;
+    private ExecutionEngine $executionEngine;
+    private ResponseBuilder $responseBuilder;
 
-    public function __construct(User $user, string $date)
-    {
-        $this->user = $user;
-        $this->date = $date;
-
-        $this->agents = [
-            'RoomAgent'        => new RoomAgent($user, $date),
-            'PatientAgent'     => new PatientAgent($user, $date),
-            'ChecklistAgent'   => new ChecklistAgent($user, $date),
-            'VitalSignsAgent'  => new VitalSignsAgent($user, $date),
-            'AppointmentAgent' => new AppointmentAgent($user, $date),
-            'ReminderAgent'    => new ReminderAgent($user, $date),
-            'NoteAgent'        => new NoteAgent($user, $date),
-        ];
+    public function __construct(
+        private User $user,
+        private string $date
+    ) {
+        $this->planValidator = new PlanValidator();
+        $this->dependencyResolver = new DependencyResolver();
+        $this->executionEngine = new ExecutionEngine($user, $date);
+        $this->responseBuilder = new ResponseBuilder();
     }
 
-    // ─────────────────────────────────────────────
-    // Preloading: when the iOS client calls Lisa from inside a patient/room
-    // view, it can attach the patient_id/room_id so the orchestrator can
-    // bind every action to that patient without relying on name resolution.
-    // ─────────────────────────────────────────────
     public function preloadPatient(?int $patientId): void
     {
-        if (!$patientId) return;
-        $patient = Patient::with('assignedRoom.day')->find($patientId);
-        if (!$patient) return;
+        if (!$patientId) {
+            return;
+        }
 
-        // Authorize: must belong to current user
-        $day = $patient->assignedRoom?->day;
-        if (!$day || $day->user_id !== $this->user->id) return;
+        $patient = Patient::with('assignedRoom.day')->find($patientId);
+        if (!$patient || !$patient->assignedRoom || !$patient->assignedRoom->day) {
+            return;
+        }
+
+        if ($patient->assignedRoom->day->user_id !== $this->user->id) {
+            return;
+        }
 
         $this->preloadedPatient = $patient;
-        if ($patient->assignedRoom) {
-            $this->preloadedRoom = $patient->assignedRoom;
-        }
+        $this->preloadedRoom = $patient->assignedRoom;
     }
 
     public function preloadRoom(?int $roomId): void
     {
-        if (!$roomId) return;
-        $room = Room::with('day')->find($roomId);
-        if (!$room || !$room->day || $room->day->user_id !== $this->user->id) return;
-        $this->preloadedRoom = $room;
-    }
-
-    // ─────────────────────────────────────────────
-    // Entry point
-    // ─────────────────────────────────────────────
-    public function handle(string $message, string $source = 'text'): array
-    {
-        // 1. Ask OpenAI for a structured action plan
-        $parsed = $this->parseWithAI($message);
-
-        if (!$parsed) {
-            return $this->stableResponse(
-                false,
-                "Lisa n'a pas pu analyser votre message. Réessayez.",
-                $message,
-                [],
-                ['ai' => ['Réponse IA invalide']]
-            );
-        }
-
-        // 2. Confirmation request — return immediately, do not execute
-        if (!empty($parsed['needs_confirmation']) && $parsed['needs_confirmation'] === true) {
-            $question = $parsed['confirmation_question'] ?? 'Pouvez-vous préciser votre demande ?';
-            return [
-                'success'               => false,
-                'needs_confirmation'    => true,
-                'confirmation_question' => $question,
-                'summary'               => $question,
-                'message'               => $question,
-                'actions'               => [],
-                'errors'                => [],
-                'data'                  => null,
-                'original_message'      => $message,
-                'missing_information'   => $parsed['missing_information'] ?? [],
-            ];
-        }
-
-        // 3. Sort actions by dependency order + filet de sécurité regex
-        $detectedActions = $parsed['detected_actions'] ?? [];
-        $detectedActions = $this->mergeRegexFallbacks($message, $detectedActions);
-        $detectedActions = $this->sortActions($detectedActions);
-
-        Log::info('LisaOrchestrator plan', [
-            'message' => $message,
-            'actions' => $detectedActions,
-        ]);
-
-        // 4. Execute everything inside a single DB transaction
-        $context = new ExecutionContext($this->user, $this->date);
-
-        // Preload patient/room into context so agents resolve them instantly
-        if ($this->preloadedRoom)    { $context->rememberRoom($this->preloadedRoom); }
-        if ($this->preloadedPatient) { $context->rememberPatient($this->preloadedPatient); }
-
-        try {
-            DB::transaction(function () use ($detectedActions, $context) {
-                foreach ($detectedActions as $action) {
-                    $this->executeAction($action, $context);
-                }
-            });
-        } catch (\Throwable $e) {
-            Log::error('LisaOrchestrator transaction failure', [
-                'error'   => $e->getMessage(),
-                'trace'   => $e->getTraceAsString(),
-                'message' => $message,
-            ]);
-            return $this->stableResponse(
-                false,
-                "Une erreur est survenue, aucune donnée n'a été enregistrée.",
-                $message,
-                [],
-                ['transaction' => [$e->getMessage()]]
-            );
-        }
-
-        // 5. Build human-readable summary
-        $summary = $this->buildSummary($context);
-        $hasResults = !empty($context->results);
-        $success    = empty($context->errors) && $hasResults;
-
-        // Convert error array → keyed errors object for stable contract
-        $errorsObject = [];
-        foreach ($context->errors as $i => $err) {
-            $errorsObject["error_{$i}"] = [$err];
-        }
-
-        return [
-            'success'             => $success,
-            'summary'             => $summary,
-            'message'             => $summary,
-            'actions'             => $context->results,
-            'errors'              => $context->errors,
-            'data'                => $hasResults ? ['results' => $context->results] : null,
-            'original_message'    => $message,
-            'missing_information' => $parsed['missing_information'] ?? [],
-        ];
-    }
-
-    // ─────────────────────────────────────────────
-    // Run a single action through its agent + capture result
-    // ─────────────────────────────────────────────
-    private function executeAction(array $action, ExecutionContext $context): void
-    {
-        $agentName = $action['agent'] ?? null;
-
-        if (!$agentName || !isset($this->agents[$agentName])) {
-            $context->addError("Agent inconnu : " . ($agentName ?? 'null'));
+        if (!$roomId) {
             return;
         }
 
-        $agent = $this->agents[$agentName];
+        $room = Room::with('day')->find($roomId);
+        if (!$room || !$room->day || $room->day->user_id !== $this->user->id) {
+            return;
+        }
 
+        $this->preloadedRoom = $room;
+    }
+
+    public function handle(string $message, string $source = 'text'): array
+    {
         try {
-            // Agents that accept an ExecutionContext use it; others fall back to their old signature
-            if (method_exists($agent, 'handleWithContext')) {
-                $result = $agent->handleWithContext($action, $context);
-            } else {
-                $result = $agent->handle($action);
+            $this->intentParser = new IntentParser(
+                $this->user,
+                $this->date,
+                $this->preloadedRoom,
+                $this->preloadedPatient
+            );
+
+            $rawPlan = $this->intentParser->parse($message);
+            $rawPlan = $this->injectContextEntities($rawPlan);
+            $rawPlan = $this->completeImplicitEntities($rawPlan);
+            $rawPlan = $this->completeImplicitOperations($rawPlan, $message);
+
+            if (($rawPlan['needs_confirmation'] ?? false) === true) {
+                return $this->responseBuilder->confirmation(
+                    $rawPlan['confirmation_question'] ?? 'Pouvez-vous préciser votre demande ?',
+                    array_values(array_filter($rawPlan['missing_information'] ?? [], 'is_string'))
+                );
             }
 
-            if (!is_array($result)) {
-                $context->addError("Réponse invalide de {$agentName}");
-                return;
-            }
+            $validatedPlan = $this->planValidator->validate($rawPlan);
+            $orderedOperations = $this->dependencyResolver->sort($validatedPlan);
 
-            if (($result['success'] ?? false) === true) {
-                $context->addResult([
-                    'agent'   => $agentName,
-                    'intent'  => $action['intent'] ?? null,
-                    'message' => $result['message'] ?? null,
-                ]);
-            } else {
-                $context->addError($result['error'] ?? "Échec de {$agentName}");
-            }
+            $context = new ExecutionContext(
+                $this->user,
+                $this->date,
+                $this->preloadedRoom,
+                $this->preloadedPatient
+            );
+
+            DB::transaction(function () use ($validatedPlan, $orderedOperations, $context, $message): void {
+                $this->executionEngine->execute($validatedPlan, $orderedOperations, $context);
+                $this->autoCreatePatientNote($validatedPlan, $message);
+            });
+
+            return $this->responseBuilder->success(
+                $context,
+                $validatedPlan,
+                $this->buildSummary($context)
+            );
+        } catch (LisaFlowException $e) {
+            return $this->responseBuilder->error($e->getMessage(), $e->errors);
         } catch (\Throwable $e) {
-            Log::error("LisaOrchestrator agent error", [
-                'agent'  => $agentName,
-                'action' => $action,
-                'error'  => $e->getMessage(),
+            Log::error('Lisa orchestrator fatal error', [
+                'message' => $message,
+                'source' => $source,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
             ]);
-            $context->addError("Erreur sur {$agentName} : {$e->getMessage()}");
+
+            return $this->responseBuilder->error(
+                'Je n’ai pas pu terminer cette action.',
+                ['server' => [$e->getMessage()]]
+            );
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Filet de sécurité : si l'IA oublie une constante / un rendez-vous,
-    // on la rajoute via regex sur le message original.
-    // ─────────────────────────────────────────────
-    private function mergeRegexFallbacks(string $message, array $actions): array
+    private function injectContextEntities(array $plan): array
     {
-        $patientName = $this->preloadedPatient?->name;
-        $roomNumber  = $this->preloadedRoom?->number;
-        foreach ($actions as $a) {
-            $patientName ??= $a['data']['patient_name'] ?? null;
-            $roomNumber  ??= $a['data']['room_number']  ?? null;
-        }
+        $plan['entities'] ??= [];
+        $plan['entities']['rooms'] ??= [];
+        $plan['entities']['patients'] ??= [];
 
-        $hasVital = false;
-        $hasAppointment = false;
-        foreach ($actions as $a) {
-            if (($a['intent'] ?? '') === 'add_vital_sign')     $hasVital = true;
-            if (($a['intent'] ?? '') === 'create_appointment') $hasAppointment = true;
-        }
-
-        // Température : "30°", "30 degrés", "température 38.5"
-        if (!$hasVital && preg_match('/(?:température\s+(?:à|de)?\s*|temp[ée]rature[\s:]*|fi[èe]vre[\s:]*)?(\d{2,3}(?:[.,]\d)?)\s*(?:°|degr[ée]s?)/iu', $message, $m)) {
-            $value = str_replace(',', '.', $m[1]);
-            if ((float) $value >= 25 && (float) $value <= 45) {
-                $actions[] = [
-                    'agent'  => 'VitalSignsAgent',
-                    'intent' => 'add_vital_sign',
-                    'data'   => [
-                        'patient_name' => $patientName,
-                        'room_number'  => $roomNumber,
-                        'type'         => 'temperature',
-                        'value'        => $value,
-                    ],
-                ];
+        $roomRefs = [];
+        foreach ($plan['entities']['rooms'] as $room) {
+            if (!empty($room['client_ref'])) {
+                $roomRefs[$room['client_ref']] = true;
             }
         }
 
-        // Tension : "tension 12/8", "TA 120/80"
-        if (preg_match('/(?:tension|TA|pression art[ée]rielle)[\s:]*(\d{2,3}\/\d{1,3})/iu', $message, $m)) {
-            $alreadyHas = false;
-            foreach ($actions as $a) {
-                if (($a['intent'] ?? '') === 'add_vital_sign' && ($a['data']['type'] ?? '') === 'blood_pressure') $alreadyHas = true;
-            }
-            if (!$alreadyHas) {
-                $actions[] = [
-                    'agent'  => 'VitalSignsAgent',
-                    'intent' => 'add_vital_sign',
-                    'data'   => [
-                        'patient_name' => $patientName,
-                        'room_number'  => $roomNumber,
-                        'type'         => 'blood_pressure',
-                        'value'        => $m[1],
-                    ],
-                ];
+        if ($this->preloadedRoom && !isset($roomRefs['active_room'])) {
+            $plan['entities']['rooms'][] = [
+                'client_ref' => 'active_room',
+                'number' => (string) $this->preloadedRoom->number,
+            ];
+        }
+
+        $patientRefs = [];
+        foreach ($plan['entities']['patients'] as $patient) {
+            if (!empty($patient['client_ref'])) {
+                $patientRefs[$patient['client_ref']] = true;
             }
         }
 
-        // Saturation : "saturation 96", "SpO2 98"
-        if (preg_match('/(?:saturation|SpO2|sat)[\s:]*(\d{2,3}(?:[.,]\d)?)/iu', $message, $m)) {
-            $alreadyHas = false;
-            foreach ($actions as $a) {
-                if (($a['intent'] ?? '') === 'add_vital_sign' && ($a['data']['type'] ?? '') === 'oxygen_saturation') $alreadyHas = true;
-            }
-            if (!$alreadyHas) {
-                $actions[] = [
-                    'agent'  => 'VitalSignsAgent',
-                    'intent' => 'add_vital_sign',
-                    'data'   => [
-                        'patient_name' => $patientName,
-                        'room_number'  => $roomNumber,
-                        'type'         => 'oxygen_saturation',
-                        'value'        => str_replace(',', '.', $m[1]),
-                    ],
-                ];
-            }
+        if ($this->preloadedPatient && !isset($patientRefs['active_patient'])) {
+            $plan['entities']['patients'][] = [
+                'client_ref' => 'active_patient',
+                'name' => $this->preloadedPatient->name,
+                'room_ref' => 'active_room',
+                'age' => $this->preloadedPatient->age,
+                'gender' => $this->preloadedPatient->gender,
+                'diagnosis' => $this->preloadedPatient->diagnosis,
+            ];
         }
 
-        // Pouls : "pouls 72", "fréquence cardiaque 80"
-        if (preg_match('/(?:pouls|fr[ée]quence\s+cardiaque|FC|bpm)[\s:]*(\d{2,3})/iu', $message, $m)) {
-            $alreadyHas = false;
-            foreach ($actions as $a) {
-                if (($a['intent'] ?? '') === 'add_vital_sign' && ($a['data']['type'] ?? '') === 'heart_rate') $alreadyHas = true;
-            }
-            if (!$alreadyHas) {
-                $actions[] = [
-                    'agent'  => 'VitalSignsAgent',
-                    'intent' => 'add_vital_sign',
-                    'data'   => [
-                        'patient_name' => $patientName,
-                        'room_number'  => $roomNumber,
-                        'type'         => 'heart_rate',
-                        'value'        => $m[1],
-                    ],
-                ];
-            }
-        }
-
-        return $actions;
+        return $plan;
     }
 
-    // ─────────────────────────────────────────────
-    // Sort actions so dependencies are satisfied
-    // ─────────────────────────────────────────────
-    private function sortActions(array $actions): array
+    private function completeImplicitEntities(array $plan): array
     {
-        usort($actions, function ($a, $b) {
-            $pa = self::INTENT_ORDER[$a['intent'] ?? ''] ?? 999;
-            $pb = self::INTENT_ORDER[$b['intent'] ?? ''] ?? 999;
-            return $pa <=> $pb;
-        });
-        return $actions;
+        $plan['entities'] ??= [];
+        $plan['entities']['rooms'] ??= [];
+        $plan['entities']['patients'] ??= [];
+        $plan['operations'] ??= [];
+
+        $roomRefs = [];
+        foreach ($plan['entities']['rooms'] as $room) {
+            if (!empty($room['client_ref'])) {
+                $roomRefs[$room['client_ref']] = $room;
+            }
+        }
+
+        $patientRefs = [];
+        foreach ($plan['entities']['patients'] as $patient) {
+            if (!empty($patient['client_ref'])) {
+                $patientRefs[$patient['client_ref']] = $patient;
+            }
+        }
+
+        $nextOpNumber = 1;
+        foreach ($plan['operations'] as $operation) {
+            if (preg_match('/^op_(\d+)$/', (string) ($operation['op_id'] ?? ''), $matches)) {
+                $nextOpNumber = max($nextOpNumber, ((int) $matches[1]) + 1);
+            }
+        }
+
+        $defaultRoomRef = array_key_exists('active_room', $roomRefs)
+            ? 'active_room'
+            : (array_key_first($roomRefs) ?: null);
+
+        $hasRoomUpsert = [];
+        $hasPatientUpsert = [];
+        foreach ($plan['operations'] as $operation) {
+            if (($operation['type'] ?? null) === 'upsert_room' && !empty($operation['data']['room_ref'])) {
+                $hasRoomUpsert[$operation['data']['room_ref']] = true;
+            }
+            if (($operation['type'] ?? null) === 'upsert_patient' && !empty($operation['data']['patient_ref'])) {
+                $hasPatientUpsert[$operation['data']['patient_ref']] = true;
+            }
+        }
+
+        foreach ($plan['operations'] as &$operation) {
+            $data = $operation['data'] ?? [];
+
+            if (!empty($data['room_ref']) && !isset($roomRefs[$data['room_ref']]) && $this->preloadedRoom) {
+                if ($this->roomRefMatchesNumber($data['room_ref'], (string) $this->preloadedRoom->number)) {
+                    $operation['data']['room_ref'] = 'active_room';
+                    $data['room_ref'] = 'active_room';
+                }
+            }
+
+            if (!empty($data['patient_ref']) && !isset($patientRefs[$data['patient_ref']])) {
+                $roomRef = $data['room_ref'] ?? $defaultRoomRef;
+
+                if ($roomRef && !isset($roomRefs[$roomRef]) && $this->preloadedRoom && $this->roomRefMatchesNumber($roomRef, (string) $this->preloadedRoom->number)) {
+                    $roomRef = 'active_room';
+                }
+
+                if ($roomRef && !isset($roomRefs[$roomRef])) {
+                    $roomNumber = $this->roomNumberFromRef($roomRef);
+                    if ($roomNumber !== null) {
+                        $roomRefs[$roomRef] = [
+                            'client_ref' => $roomRef,
+                            'number' => $roomNumber,
+                        ];
+                        $plan['entities']['rooms'][] = $roomRefs[$roomRef];
+                    }
+                }
+
+                $name = $data['patient_name'] ?? $this->patientNameFromRef($data['patient_ref']);
+                if ($name && $roomRef) {
+                    $patientRefs[$data['patient_ref']] = [
+                        'client_ref' => $data['patient_ref'],
+                        'name' => $name,
+                        'room_ref' => $roomRef,
+                        'age' => null,
+                        'gender' => null,
+                        'diagnosis' => null,
+                    ];
+                    $plan['entities']['patients'][] = $patientRefs[$data['patient_ref']];
+                }
+            }
+        }
+        unset($operation);
+
+        foreach ($roomRefs as $roomRef => $room) {
+            if ($roomRef === 'active_room' || isset($hasRoomUpsert[$roomRef])) {
+                continue;
+            }
+
+            $plan['operations'][] = [
+                'op_id' => 'op_' . $nextOpNumber++,
+                'type' => 'upsert_room',
+                'depends_on' => [],
+                'data' => [
+                    'room_ref' => $roomRef,
+                ],
+            ];
+            $hasRoomUpsert[$roomRef] = true;
+        }
+
+        foreach ($patientRefs as $patientRef => $patient) {
+            if ($patientRef === 'active_patient' || isset($hasPatientUpsert[$patientRef])) {
+                continue;
+            }
+
+            $dependsOn = [];
+            if (!empty($patient['room_ref']) && isset($hasRoomUpsert[$patient['room_ref']])) {
+                foreach ($plan['operations'] as $operation) {
+                    if (($operation['type'] ?? null) === 'upsert_room' && ($operation['data']['room_ref'] ?? null) === $patient['room_ref']) {
+                        $dependsOn[] = $operation['op_id'];
+                        break;
+                    }
+                }
+            }
+
+            $plan['operations'][] = [
+                'op_id' => 'op_' . $nextOpNumber++,
+                'type' => 'upsert_patient',
+                'depends_on' => $dependsOn,
+                'data' => [
+                    'patient_ref' => $patientRef,
+                    'room_ref' => $patient['room_ref'],
+                ],
+            ];
+            $hasPatientUpsert[$patientRef] = true;
+        }
+
+        return $plan;
     }
 
-    // ─────────────────────────────────────────────
-    // OpenAI call — returns structured JSON or null
-    // ─────────────────────────────────────────────
-    private function parseWithAI(string $message): ?array
+    /**
+     * The model proposes the plan, then the backend completes obvious clinical
+     * operations. This prevents a valid room/patient/checklist flow from
+     * silently missing a vital sign like "Robert a 30°".
+     */
+    private function completeImplicitOperations(array $plan, string $message): array
     {
-        $contextHint = '';
+        $temperature = $this->extractTemperature($message);
+        if ($temperature === null) {
+            return $plan;
+        }
+
+        $patientRef = $this->patientRefForTemperature($plan, $message);
+        if ($patientRef === null) {
+            return $plan;
+        }
+
+        foreach ($plan['operations'] ?? [] as $operation) {
+            $data = $operation['data'] ?? [];
+            $type = $operation['type'] ?? null;
+
+            if ($type === 'add_vital'
+                && ($data['patient_ref'] ?? null) === $patientRef
+                && $this->normalizeVitalTypeForComparison((string) ($data['type'] ?? '')) === 'temperature'
+            ) {
+                return $plan;
+            }
+        }
+
+        $nextOpNumber = $this->nextOperationNumber($plan['operations'] ?? []);
+        $dependsOn = $this->dependencyForPatientRef($plan['operations'] ?? [], $patientRef);
+
+        $plan['operations'][] = [
+            'op_id' => 'op_' . $nextOpNumber,
+            'type' => 'add_vital',
+            'depends_on' => $dependsOn,
+            'data' => [
+                'patient_ref' => $patientRef,
+                'type' => 'temperature',
+                'value' => $temperature,
+                'unit' => '°C',
+            ],
+        ];
+
+        return $plan;
+    }
+
+    private function extractTemperature(string $message): ?float
+    {
+        $normalized = mb_strtolower($message);
+
+        $patterns = [
+            '/temp[ée]rature\s*(?:est|à|a|de|:)?\s*(?:de\s*)?(\d+(?:[,.]\d+)?)/u',
+            '/(\d+(?:[,.]\d+)?)\s*(?:°\s*c?|degr[ée]s?)\s*(?:de\s*)?temp[ée]rature/u',
+            '/(?:a|à|avec|présente)\s+(\d+(?:[,.]\d+)?)\s*(?:°\s*c?|degr[ée]s?)(?!\s*(?:ans|an))/u',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $normalized, $matches)) {
+                return (float) str_replace(',', '.', $matches[1]);
+            }
+        }
+
+        return null;
+    }
+
+    private function patientRefForTemperature(array $plan, string $message): ?string
+    {
+        $patients = $plan['entities']['patients'] ?? [];
+
         if ($this->preloadedPatient) {
-            $contextHint .= "\nContexte actif : tu es DÉJÀ dans le dossier du patient « {$this->preloadedPatient->name} »";
-            if ($this->preloadedRoom) {
-                $contextHint .= " (chambre {$this->preloadedRoom->number})";
-            }
-            $contextHint .= ". Toute action s'applique à ce patient. Tu n'as pas besoin de create_room ni create_patient.";
-        } elseif ($this->preloadedRoom) {
-            $contextHint = "\nContexte actif : tu es DÉJÀ dans la chambre {$this->preloadedRoom->number}.";
+            return 'active_patient';
         }
 
-        $systemPrompt = <<<PROMPT
-Tu es Lisa, un orchestrateur IA pour une application infirmière.{$contextHint}
-Tu comprends les messages naturels de l'utilisatrice et tu les transformes en actions structurées.
+        if (count($patients) === 1 && !empty($patients[0]['client_ref'])) {
+            return (string) $patients[0]['client_ref'];
+        }
 
-Règles absolues :
-- Ne jamais inventer d'informations non présentes dans le message
-- Ne jamais faire de diagnostic médical
-- Ne jamais prescrire de médicaments
-- Si une information est absente, mettre null
-- Si le patient ou la chambre n'est pas clairement identifié, demander confirmation
-
-Normalisation OBLIGATOIRE :
-- "numéro une", "chambre une", "1ère" => "1"
-- "numéro deux", "chambre deux"        => "2"
-- "30°", "30 degrés"                   => value="30" type="temperature"
-- "tension 12/8"                       => value="12/8" type="blood_pressure"
-- "15h", "15 heures"                   => "15h00"
-- "15h30"                              => "15h30"
-
-Agents disponibles : RoomAgent, PatientAgent, ChecklistAgent, VitalSignsAgent, AppointmentAgent, ReminderAgent, NoteAgent
-
-IMPORTANT : pour une phrase qui mentionne une chambre + un patient, tu DOIS produire :
-1. create_room (RoomAgent) avec room_number
-2. create_patient (PatientAgent) avec patient_name + room_number
-3. ENSUITE seulement les autres actions (constantes, rendez-vous, …)
-
-Retourne UNIQUEMENT un JSON valide avec cette structure :
-{
-  "original_message": "...",
-  "detected_actions": [
-    {
-      "agent": "RoomAgent",
-      "intent": "create_room",
-      "data": { "room_number": "1" }
-    },
-    {
-      "agent": "PatientAgent",
-      "intent": "create_patient",
-      "data": { "patient_name": "Robert", "room_number": "1" }
-    },
-    {
-      "agent": "VitalSignsAgent",
-      "intent": "add_vital_sign",
-      "data": { "patient_name": "Robert", "room_number": "1", "type": "temperature", "value": "30", "unit": "°C", "time": null }
-    },
-    {
-      "agent": "AppointmentAgent",
-      "intent": "create_appointment",
-      "data": { "patient_name": "Robert", "room_number": "1", "title": "Voir le médecin", "due_label": "15h00", "priority": "high" }
-    }
-  ],
-  "missing_information": [],
-  "needs_confirmation": false,
-  "confirmation_question": null
-}
-
-Intents disponibles par agent :
-- RoomAgent       : create_room, find_room
-- PatientAgent    : create_patient, find_patient
-- VitalSignsAgent : add_vital_sign (types: temperature, blood_pressure, heart_rate, oxygen_saturation, respiratory_rate, blood_glucose, pain_level, weight)
-- ChecklistAgent  : create_checklist_item, toggle_checklist_item
-- AppointmentAgent: create_appointment (toujours avec due_label)
-- ReminderAgent   : create_reminder
-- NoteAgent       : create_note (pour les observations libres sans action claire)
-
-Toujours inclure `room_number` dans `data` quand c'est connu, même pour les agents secondaires (constantes, rendez-vous).
-
-Date du jour : {$this->date}
-PROMPT;
-
-        try {
-            $response = Http::withToken(config('services.openai.key'))
-                ->timeout(30)
-                ->post('https://api.openai.com/v1/chat/completions', [
-                    'model'           => config('services.openai.model', 'gpt-4o-mini'),
-                    'messages'        => [
-                        ['role' => 'system', 'content' => $systemPrompt],
-                        ['role' => 'user',   'content' => $message],
-                    ],
-                    'response_format' => ['type' => 'json_object'],
-                    'max_tokens'      => 2000,
-                    'temperature'     => 0.1,
-                ]);
-
-            $content = $response->json('choices.0.message.content');
-            $parsed  = json_decode($content, true);
-
-            if (!$parsed || !isset($parsed['detected_actions'])) {
-                Log::warning('LisaOrchestrator: invalid AI response', ['content' => $content]);
-                return null;
+        $normalizedMessage = $this->normalizeText($message);
+        foreach ($patients as $patient) {
+            $name = $this->normalizeText((string) ($patient['name'] ?? ''));
+            if ($name !== '' && str_contains($normalizedMessage, $name) && !empty($patient['client_ref'])) {
+                return (string) $patient['client_ref'];
             }
+        }
 
-            return $parsed;
-        } catch (\Exception $e) {
-            Log::error('LisaOrchestrator: OpenAI error', ['error' => $e->getMessage()]);
+        return null;
+    }
+
+    private function dependencyForPatientRef(array $operations, string $patientRef): array
+    {
+        if ($patientRef === 'active_patient') {
+            return [];
+        }
+
+        foreach ($operations as $operation) {
+            if (($operation['type'] ?? null) === 'upsert_patient'
+                && ($operation['data']['patient_ref'] ?? null) === $patientRef
+                && !empty($operation['op_id'])
+            ) {
+                return [(string) $operation['op_id']];
+            }
+        }
+
+        return [];
+    }
+
+    private function nextOperationNumber(array $operations): int
+    {
+        $next = 1;
+        foreach ($operations as $operation) {
+            if (preg_match('/^op_(\d+)$/', (string) ($operation['op_id'] ?? ''), $matches)) {
+                $next = max($next, ((int) $matches[1]) + 1);
+            }
+        }
+
+        return $next;
+    }
+
+    private function normalizeVitalTypeForComparison(string $type): string
+    {
+        return match (mb_strtolower(trim($type))) {
+            'temp', 'température', 'temperature' => 'temperature',
+            default => mb_strtolower(trim($type)),
+        };
+    }
+
+    private function normalizeText(string $text): string
+    {
+        $text = mb_strtolower(trim($text));
+        $text = str_replace(['’', "'"], ' ', $text);
+        $text = preg_replace('/[^\pL\pN]+/u', ' ', $text) ?? $text;
+        return trim(preg_replace('/\s+/u', ' ', $text) ?? $text);
+    }
+
+    private function patientNameFromRef(string $patientRef): ?string
+    {
+        $normalized = preg_replace('/^patient_/', '', trim($patientRef));
+        $normalized = str_replace('_', ' ', (string) $normalized);
+        $normalized = trim($normalized);
+
+        if ($normalized === '') {
             return null;
         }
+
+        return mb_convert_case($normalized, MB_CASE_TITLE, 'UTF-8');
     }
 
-    // ─────────────────────────────────────────────
-    // Build a human-friendly summary from results
-    // ─────────────────────────────────────────────
-    private function buildSummary(ExecutionContext $context): string
+    private function roomNumberFromRef(string $roomRef): ?string
     {
-        $counts = [
-            'chambres'    => 0,
-            'patients'    => 0,
-            'constantes'  => 0,
-            'rendez-vous' => 0,
-            'tâches'      => 0,
-            'rappels'     => 0,
-            'notes'       => 0,
-        ];
-
-        foreach ($context->results as $result) {
-            match ($result['agent'] ?? '') {
-                'RoomAgent'        => $counts['chambres']++,
-                'PatientAgent'     => $counts['patients']++,
-                'VitalSignsAgent'  => $counts['constantes']++,
-                'AppointmentAgent' => $counts['rendez-vous']++,
-                'ChecklistAgent'   => $counts['tâches']++,
-                'ReminderAgent'    => $counts['rappels']++,
-                'NoteAgent'        => $counts['notes']++,
-                default            => null,
-            };
+        if (preg_match('/(\d+)/', $roomRef, $matches)) {
+            return (string) (int) $matches[1];
         }
 
+        return null;
+    }
+
+    private function roomRefMatchesNumber(string $roomRef, string $roomNumber): bool
+    {
+        $derived = $this->roomNumberFromRef($roomRef);
+        return $derived !== null && $derived === (string) (int) $roomNumber;
+    }
+
+    private function buildSummary(ExecutionContext $context): string
+    {
         $parts = [];
-        foreach ($counts as $label => $count) {
-            if ($count > 0) {
-                $parts[] = "{$count} {$label}";
+
+        if ($context->created['rooms'] > 0) {
+            $parts[] = $context->created['rooms'] . ' chambre' . ($context->created['rooms'] > 1 ? 's' : '');
+        }
+
+        if ($context->created['patients'] > 0) {
+            $parts[] = $context->created['patients'] . ' patient' . ($context->created['patients'] > 1 ? 's' : '');
+        }
+
+        if ($context->created['vitals'] > 0) {
+            $parts[] = $context->created['vitals'] . ' constante' . ($context->created['vitals'] > 1 ? 's' : '');
+        }
+
+        if ($context->created['appointments'] > 0) {
+            $parts[] = $context->created['appointments'] . ' rendez-vous';
+        }
+
+        if ($context->created['checklist_items'] > 0) {
+            $parts[] = $context->created['checklist_items'] . ' checklist' . ($context->created['checklist_items'] > 1 ? 's' : '');
+        }
+
+        if ($context->created['notes'] > 0) {
+            $parts[] = $context->created['notes'] . ' note' . ($context->created['notes'] > 1 ? 's' : '');
+        }
+
+        if (empty($parts)) {
+            return 'Aucune modification à enregistrer.';
+        }
+
+        return 'Lisa a enregistré : ' . implode(', ', $parts) . '.';
+    }
+
+    /**
+     * When the user dictates from a patient view (preloadedPatient set), guarantee that
+     * the original message is saved as a note attached to the patient — even if the AI
+     * plan didn't include a create_note op. This preserves the dictation as a clinical
+     * trace alongside any structured action (vital, appointment, etc.).
+     */
+    private function autoCreatePatientNote(array $plan, string $message): void
+    {
+        if (!$this->preloadedPatient) {
+            return;
+        }
+
+        $trimmed = trim($message);
+        if ($trimmed === '') {
+            return;
+        }
+
+        // Skip if the plan already produced a note for this patient — avoid duplicates.
+        foreach ($plan['operations'] ?? [] as $operation) {
+            if (($operation['type'] ?? null) === 'create_note') {
+                $ref = $operation['data']['patient_ref'] ?? null;
+                if ($ref === 'active_patient' || $ref === null) {
+                    return;
+                }
             }
         }
 
-        if (empty($parts) && empty($context->errors)) {
-            return 'Aucune action effectuée';
-        }
-
-        if (empty($parts) && !empty($context->errors)) {
-            return $context->errors[0];
-        }
-
-        $summary = 'Lisa a enregistré : ' . implode(', ', $parts);
-
-        if (!empty($context->errors)) {
-            $summary .= ' (' . count($context->errors) . ' avertissement' . (count($context->errors) > 1 ? 's' : '') . ')';
-        }
-
-        return $summary;
+        VoiceNote::create([
+            'user_id' => $this->user->id,
+            'patient_id' => $this->preloadedPatient->id,
+            'raw_text' => $trimmed,
+            'structured_text' => $trimmed,
+        ]);
     }
 
-    // ─────────────────────────────────────────────
-    // Stable error response
-    // ─────────────────────────────────────────────
-    private function stableResponse(bool $success, string $message, string $original, array $actions = [], array $errors = []): array
-    {
-        return [
-            'success'             => $success,
-            'summary'             => $message,
-            'message'             => $message,
-            'actions'             => $actions,
-            'errors'              => array_values(array_map(fn ($e) => is_array($e) ? ($e[0] ?? '') : $e, $errors)),
-            'data'                => null,
-            'original_message'    => $original,
-            'missing_information' => [],
-        ];
-    }
 }
